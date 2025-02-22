@@ -1,0 +1,148 @@
+service: ${env:service, 'scaapescale-lambda'}
+frameworkVersion: ">=1.35.0 <2.0.0"
+
+provider:
+  name: aws
+  memorySize: 128 # optional, in MB, default is 1024
+  stackTags:
+    service: ${self:service}
+    stackPurpose: ${env:stack_purpose_tag, 'manual'}
+  runtime: python3.9
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'main'}
+  managedPolicyArns: "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+  tracing: true
+  environment:
+    PYTHONPATH: "/opt/lib/python3.9/site-packages:src:/var/task/src:/var/runtime"
+    STAGE: ${self:provider.stage}
+    # PAYPAL_API_URL: ${ssm:/paypal/${self:provider.stage}/api_url}
+    PAYPAL_SECRET: ${ssm:/paypal/${self:provider.stage}/secret}
+    PAYPAL_CLIENT_ID: ${ssm:/paypal/${self:provider.stage}/client_id}
+    # WEBHOOK_RETURN_URL: ${ssm:/your-app/${self:provider.stage}/webhook_return_url}
+    # RETURN_URL: ${ssm:/your-app/${self:provider.stage}/return_url}
+
+custom:
+  state_stack: ${self:service}-${self:provider.stage}-state
+  deploymentSettings:
+    stages:
+      - staging
+      - main
+
+package:
+  exclude:
+    - ./**
+  include:
+    - "src/**"
+    - "resources/**"
+    - "!src/tests/**"
+
+layers:
+  requirements:
+    path: .venv
+    package:
+      exclude:
+        - "**"
+        - "!lib/python3.9/site-packages/**"
+        - "lib/python3.9/site-packages/pip/**"
+        - "lib/python3.9/site-packages/docutils/**"
+        - "lib/python3.9/site-packages/future/**"
+        - "lib/python3.9/site-packages/setuptools/**"
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-cloudformation-changesets
+  - serverless-step-functions
+  - serverless-pseudo-parameters
+ecr:
+    images:
+      ecsAppImage:
+        path: . # Points to Dockerfile location
+
+iam:
+  role:
+    statements:
+      - Effect: "Allow"
+        Action:
+          - "ecs:RunTask"
+          - "ecs:DescribeTasks"
+          - "ecs:StopTask"
+          - "sqs:ReceiveMessage"
+          - "sqs:DeleteMessage"
+          - "sqs:GetQueueAttributes"
+        Resource: "*"
+
+functions:
+  test_ok:
+    handler: src.handlers.test_size.test_package_size
+    timeout: 20
+    layers:
+      - { Ref: RequirementsLambdaLayer }
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - execute-api:Invoke
+          - lambda:InvokeFunction
+        Resource: "*"
+      - Effect: Allow
+        Action:
+          - ssm:GetParameter
+        Resource: arn:aws:ssm:us-east-1:840590911230:parameter/*
+  ecsSqsWorker:
+    image:
+      name: ScrapeAppImage
+      command: ["python", "/app/src/app.py"]
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - MyQueue
+              - Arn
+          batchSize: 10
+
+resources:
+  Resources:
+    ScrapeQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ecs-scrape-task-queue
+
+    ScrapeEcsCluster:
+      Type: "AWS::ECS::Cluster"
+      Properties:
+        ClusterName: scrape-ecs-cluster
+
+    ScrapeEcsTaskDefinition:
+      Type: "AWS::ECS::TaskDefinition"
+      Properties:
+        Family: scrape-ecs-task
+        NetworkMode: awsvpc
+        RequiresCompatibilities:
+          - FARGATE
+        Cpu: "256"
+        Memory: "512"
+        ContainerDefinitions:
+          - Name: scrape-ecs-container
+            Image:
+              !Sub "${{self:provider.ecr.images.ecsAppImage}}"
+            Essential: true
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: /ecs/scrape-ecs-task
+                awslogs-region: ${self:provider.region}
+                awslogs-stream-prefix: ecs
+
+    ScrapeEcsService:
+      Type: "AWS::ECS::Service"
+      Properties:
+        Cluster: !Ref ScrapeEcsCluster
+        TaskDefinition: !Ref ScrapeEcsTaskDefinition
+        DesiredCount: 1
+        LaunchType: FARGATE
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            AssignPublicIp: ENABLED
+            Subnets:
+              - subnet-xxxxxxxx
+            SecurityGroups:
+              - sg-xxxxxxxxx

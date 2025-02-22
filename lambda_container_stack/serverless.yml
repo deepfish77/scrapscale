@@ -1,0 +1,85 @@
+service: ${env:service, 'scaapescale-lambda-container'}
+frameworkVersion: ">=1.35.0 <2.0.0"
+
+provider:
+  name: aws
+  memorySize: 128 # optional, in MB, default is 1024
+  stackTags:
+    service: ${self:service}
+    stackPurpose: ${env:stack_purpose_tag, 'manual'}
+  runtime: python3.9
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'main'}
+  managedPolicyArns: "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+  tracing: true
+  environment:
+    PYTHONPATH: "/opt/lib/python3.9/site-packages:src:/var/task/src:/var/runtime"
+    STAGE: ${self:provider.stage}
+
+custom:
+  state_stack: ${self:service}-${self:provider.stage}-state
+  deploymentSettings:
+    stages:
+      - staging
+      - main
+
+package:
+  exclude:
+    - ./**
+  include:
+    - "src/**"
+    - "resources/**"
+    - "!src/tests/**"
+
+layers:
+  requirements:
+    path: .venv
+    package:
+      exclude:
+        - "**"
+        - "!lib/python3.9/site-packages/**"
+        - "lib/python3.9/site-packages/pip/**"
+        - "lib/python3.9/site-packages/docutils/**"
+        - "lib/python3.9/site-packages/future/**"
+        - "lib/python3.9/site-packages/setuptools/**"
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-cloudformation-changesets
+  - serverless-step-functions
+  - serverless-pseudo-parameters
+ecr:
+    images:
+      ecsAppImage:
+        path: . # Points to Dockerfile location
+
+iam:
+  role:
+    statements:
+      - Effect: "Allow"
+        Action:
+          - "ecs:RunTask"
+          - "ecs:DescribeTasks"
+          - "ecs:StopTask"
+          - "sqs:ReceiveMessage"
+          - "sqs:DeleteMessage"
+          - "sqs:GetQueueAttributes"
+        Resource: "*"
+
+functions:
+   # Lambda function using the container image
+  containerAppFunction:
+    image:
+      name: lambdaContainerImage
+      command: ["app.lambda_handler"] # Executes the dispatcher function
+    timeout: 30
+    memorySize: 512
+    environment:
+      HANDLER: "app" # Set the specific handler to be triggered
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - execute-api:Invoke
+          - lambda:InvokeFunction
+          - ssm:GetParameter
+        Resource: "*"
